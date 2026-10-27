@@ -147,13 +147,52 @@ def doc_tat_ca(files):
     return chi_tiet, pd.DataFrame(nk)
 
 
+MAU_DAI = re.compile(r"^(?P<dau>.+)X\s*(?P<dai>\d+(?:[.,]\d+)?)(?P<duoi>\s*MM)?\s*$")
+SO_PHAN_TU_GIONG = 4  # số phần tử đầu tên gọi phải giống nhau mới gộp
+
+
+def tach_chieu_dai(ten: str):
+    """'THANH U100X50X5X2200 MM' -> ('THANH U100X50X5', 2200.0, ' MM').
+    Chỉ tách khi phần đầu có ít nhất 4 phần tử (THANH, U100, 50, 5); nếu không trả về (ten, NaN, '')."""
+    m = MAU_DAI.match(ten)
+    if m and len(re.findall(r"[^\sX]+", m["dau"])) >= SO_PHAN_TU_GIONG:
+        return m["dau"].strip(), float(m["dai"].replace(",", ".")), m["duoi"] or ""
+    return ten, float("nan"), ""
+
+
+def so_gon(v: float) -> str:
+    return str(int(v)) if float(v).is_integer() else f"{v:g}"
+
+
+def gop_ten_thep_hinh(hinh: pd.DataFrame) -> pd.DataFrame:
+    """Gộp các thanh cùng phần đầu tên gọi (khác chiều dài), cộng các chiều dài rồi tách ra:
+    vd 2200 + 3300 -> Tên gọi 'THANH U100X50X5X', Quy cách '5500 mm'.
+    Số lượng (cây) tính theo tổng chiều dài thực tế."""
+    kq = []
+    for (khoa, qc), g in hinh.groupby(["Khóa", QC], sort=False):
+        dai = g["Dài tên"].dropna().unique()
+        if len(dai):
+            ten = f"{khoa}X"
+            qc_moi = f"{so_gon(dai.sum())} mm"
+            qc_moi = f"{qc} - {qc_moi}" if qc else qc_moi  # giữ quy cách gốc nếu file có sẵn
+        else:
+            ten, qc_moi = khoa, qc
+        kq.append({"Nội dung": ten, QC: qc_moi, "Dài (mm)": g["Dài (mm)"].sum()})
+    return pd.DataFrame(kq, columns=["Nội dung", QC, "Dài (mm)"])
+
+
 def tong_hop(ct: pd.DataFrame) -> pd.DataFrame:
     """Gom theo Tên gọi + Quy cách/Ký mã hiệu. Thép hình (ĐVT thanh) quy ra cây 6m làm tròn lên."""
     is_thanh = ct["ĐVT"] == "THANH"
 
     hinh = ct[is_thanh].copy()
-    hinh["Dài (mm)"] = hinh["Quy đổi (mm)"].fillna(0) * hinh["Nhu cầu"]
-    hinh = hinh.groupby(["Nội dung", QC], as_index=False)["Dài (mm)"].sum()
+    tach = hinh["Nội dung"].map(tach_chieu_dai)
+    hinh["Khóa"] = tach.map(lambda t: t[0])
+    hinh["Dài tên"] = tach.map(lambda t: t[1])
+    hinh["Đuôi"] = tach.map(lambda t: t[2])
+    # Chiều dài 1 thanh: ưu tiên cột quy đổi, nếu trống thì lấy số cuối trong tên gọi
+    hinh["Dài (mm)"] = hinh["Quy đổi (mm)"].fillna(hinh["Dài tên"]).fillna(0) * hinh["Nhu cầu"]
+    hinh = gop_ten_thep_hinh(hinh)
     hinh["ĐVT"] = "CÂY"
     hinh["Số lượng"] = hinh["Dài (mm)"].map(lambda v: math.ceil(v / CAY_MM - 1e-9))
 
@@ -172,6 +211,7 @@ def tong_hop(ct: pd.DataFrame) -> pd.DataFrame:
     bang["Đơn giá"] = float("nan")
     bang["Thành tiền"] = float("nan")
     bang["Ghi chú"] = ""
+    bang.loc[(bang["ĐVT"] == "CÂY") & (bang["Số lượng"] == 0), "Ghi chú"] = "Thiếu chiều dài, kiểm tra lại"
     bang = bang.rename(columns={"Nội dung": "Tên gọi", "ĐVT": "Đơn vị tính"})
     return bang[COT_KQ]
 
@@ -218,7 +258,10 @@ def xuat_excel(bang: pd.DataFrame, nhat_ky: pd.DataFrame) -> bytes:
                 c.font = dam if c.row == ws.max_row else thuong
                 c.alignment = Alignment(vertical="center", wrap_text=True)
             if c.column in (5, 6, 7) and c.row > 1:
-                c.number_format = "#,##0.##" if c.column == 5 else "#,##0"
+                if c.column == 5 and isinstance(c.value, float) and not c.value.is_integer():
+                    c.number_format = "#,##0.###"
+                else:
+                    c.number_format = "#,##0"  # số nguyên không còn dấu chấm thừa (4. -> 4)
             if c.column in (1, 4) and c.row > 1:
                 c.alignment = Alignment(horizontal="center", vertical="center")
 
